@@ -1,0 +1,18 @@
+target build {
+       depends: start link
+       println("Finished in {DEPENDENDS_EXECUTION_TIME}")
+}
+
+target link {
+       depends: compile
+       g++ forge.o -o forge
+}
+
+target compile {
+       g++ -c forge.cpp -o forge.o
+}
+
+# Executes before the other target since its first so here you can toogle things
+target start {
+       set_verbose(true)
+}
