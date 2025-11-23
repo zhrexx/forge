@@ -1,15 +1,25 @@
+BUILD_FOLDER = "build"
+
+target init {
+       mkdir {BUILD_FOLDER}
+}
+
 target build {
-       depends: start link
-       println("Finished in {DEPENDENDS_EXECUTION_TIME}")
+       depends: start init link
+       println("Finished in {DEPENDENDS_EXECUTION_TIME}s")
 }
 
 target link {
+       inputs: {BUILD_FOLDER}/forge.o
+       outputs: {BUILD_FOLDER}/forge
        depends: compile
-       g++ forge.o -o forge
+       g++ {BUILD_FOLDER}/forge.o -o {BUILD_FOLDER}/forge
 }
 
 target compile {
-       g++ -c forge.cpp -o forge.o
+       inputs: forge.cpp
+       outputs: {BUILD_FOLDER}/forge.o
+       g++ -c forge.cpp -o {BUILD_FOLDER}/forge.o
 }
 
 # Executes before the other target since its first so here you can toogle things

@@ -9,6 +9,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <regex>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 
 namespace fs = std::filesystem;
 
@@ -32,7 +38,10 @@ struct Value {
 struct Target {
     std::string name;
     std::vector<std::string> depends;
+    std::vector<std::string> inputs;
+    std::vector<std::string> outputs;
     std::vector<std::string> commands;
+    bool phony = false;
 };
 
 struct Function {
@@ -46,8 +55,14 @@ private:
     std::map<std::string, Target> targets;
     std::map<std::string, Function> functions;
     std::set<std::string> executed;
+    std::set<std::string> in_progress;
+    std::map<std::string, int> dep_count;
+    std::mutex exec_mutex;
+    std::condition_variable exec_cv;
+    std::atomic<bool> has_error{false};
     bool dry_run = false;
     bool verbose = false;
+    int max_jobs = 1;
     
     std::string trim(const std::string& s) {
         auto start = s.find_first_not_of(" \t\r\n");
@@ -212,7 +227,6 @@ private:
                 }
                 
                 if (fs::exists(dir)) {
-                    std::regex regex_pattern(search_pattern);
                     std::string regex_str = search_pattern;
                     size_t pos = 0;
                     while ((pos = regex_str.find('*', pos)) != std::string::npos) {
@@ -260,6 +274,7 @@ private:
             return Value("linux");
             #endif
         } else if (func == "println") {
+            std::lock_guard<std::mutex> lock(exec_mutex);
             for (size_t i = 0; i < args.size(); i++) {
                 std::string arg = strip_quotes(expand(args[i], local_vars));
                 std::cout << arg;
@@ -268,6 +283,7 @@ private:
             std::cout << std::endl;
             return Value("");
         } else if (func == "print") {
+            std::lock_guard<std::mutex> lock(exec_mutex);
             for (size_t i = 0; i < args.size(); i++) {
                 std::string arg = strip_quotes(expand(args[i], local_vars));
                 std::cout << arg;
@@ -275,9 +291,9 @@ private:
             }
             return Value("");
         } else if (func == "set_verbose" && args.size() == 1) {
-	    verbose = expand(strip_quotes(args[0]), local_vars) == "true" ? true : false;
-	    return Value("");
-	}
+            verbose = expand(strip_quotes(args[0]), local_vars) == "true" ? true : false;
+            return Value("");
+        }
         
         return Value("");
     }
@@ -318,21 +334,31 @@ private:
         if (expanded.find("mkdir ") == 0) {
             std::string path = trim(expanded.substr(6));
             if (dry_run) {
+                std::lock_guard<std::mutex> lock(exec_mutex);
                 std::cout << "[DRY] " << expanded << std::endl;
             } else {
                 fs::create_directories(path);
-                if (verbose) std::cout << expanded << std::endl;
+                if (verbose) {
+                    std::lock_guard<std::mutex> lock(exec_mutex);
+                    std::cout << expanded << std::endl;
+                }
             }
             return;
         }
         
         if (dry_run) {
+            std::lock_guard<std::mutex> lock(exec_mutex);
             std::cout << "[DRY] " << expanded << std::endl;
         } else {
-            if (verbose) std::cout << expanded << std::endl;
+            if (verbose) {
+                std::lock_guard<std::mutex> lock(exec_mutex);
+                std::cout << expanded << std::endl;
+            }
             int ret = system(expanded.c_str());
             if (ret != 0) {
+                std::lock_guard<std::mutex> lock(exec_mutex);
                 std::cerr << "Command failed with exit code " << ret << std::endl;
+                has_error = true;
                 exit(ret);
             }
         }
@@ -445,6 +471,157 @@ private:
         }
     }
     
+    fs::file_time_type get_newest_time(const std::vector<std::string>& files) {
+        auto newest = fs::file_time_type::min();
+        for (const auto& file : files) {
+            if (fs::exists(file)) {
+                auto ftime = fs::last_write_time(file);
+                if (ftime > newest) {
+                    newest = ftime;
+                }
+            }
+        }
+        return newest;
+    }
+    
+    fs::file_time_type get_oldest_time(const std::vector<std::string>& files) {
+        auto oldest = fs::file_time_type::max();
+        bool found_any = false;
+        for (const auto& file : files) {
+            if (fs::exists(file)) {
+                found_any = true;
+                auto ftime = fs::last_write_time(file);
+                if (ftime < oldest) {
+                    oldest = ftime;
+                }
+            }
+        }
+        return found_any ? oldest : fs::file_time_type::min();
+    }
+    
+    bool needs_rebuild(const Target& target) {
+        if (target.phony) return true;
+        
+        if (target.outputs.empty()) return true;
+        
+        bool all_outputs_exist = true;
+        for (const auto& output : target.outputs) {
+            if (!fs::exists(output)) {
+                all_outputs_exist = false;
+                break;
+            }
+        }
+        
+        if (!all_outputs_exist) return true;
+        
+        if (target.inputs.empty()) return false;
+        
+        auto newest_input = get_newest_time(target.inputs);
+        auto oldest_output = get_oldest_time(target.outputs);
+        
+        return newest_input > oldest_output;
+    }
+    
+    bool can_execute(const std::string& name) {
+        if (!targets.count(name)) return false;
+        
+        Target& target = targets[name];
+        for (const auto& dep : target.depends) {
+            if (!executed.count(dep) || in_progress.count(dep)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    void execute_target_parallel(const std::string& name) {
+        {
+            std::lock_guard<std::mutex> lock(exec_mutex);
+            if (executed.count(name)) return;
+            if (in_progress.count(name)) return;
+            in_progress.insert(name);
+        }
+        
+        if (!targets.count(name)) {
+            std::lock_guard<std::mutex> lock(exec_mutex);
+            std::cerr << "Target not found: " << name << std::endl;
+            has_error = true;
+            exit(1);
+        }
+        
+        Target& target = targets[name];
+
+        auto start__ = std::chrono::high_resolution_clock::now(); 
+        
+        for (const auto& dep : target.depends) {
+            bool dep_done = false;
+            while (!dep_done && !has_error) {
+                {
+                    std::lock_guard<std::mutex> lock(exec_mutex);
+                    dep_done = executed.count(dep) > 0;
+                }
+                if (!dep_done) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+        }
+
+        if (has_error) {
+            std::lock_guard<std::mutex> lock(exec_mutex);
+            in_progress.erase(name);
+            return;
+        }
+
+        auto end__ = std::chrono::high_resolution_clock::now();
+        const std::chrono::duration<double> depends_took = end__ - start__;
+        
+        {
+            std::lock_guard<std::mutex> lock(exec_mutex);
+            vars["DEPENDENDS_EXECUTION_TIME"] = Value(std::to_string(depends_took.count()));
+        }
+        
+        if (!needs_rebuild(target)) {
+            if (verbose) {
+                std::lock_guard<std::mutex> lock(exec_mutex);
+                std::cout << "==> Target '" << name << "' is up to date" << std::endl;
+            }
+            std::lock_guard<std::mutex> lock(exec_mutex);
+            executed.insert(name);
+            in_progress.erase(name);
+            exec_cv.notify_all();
+            return;
+        }
+        
+        if (verbose) {
+            std::lock_guard<std::mutex> lock(exec_mutex);
+            std::cout << "==> Running target: " << name << std::endl;
+        }
+
+        std::map<std::string, Value> local_vars;
+        local_vars["INPUTS"] = Value(target.inputs);
+        local_vars["OUTPUTS"] = Value(target.outputs);
+        
+        execute_block(target.commands, local_vars);
+        
+        {
+            std::lock_guard<std::mutex> lock(exec_mutex);
+            executed.insert(name);
+            in_progress.erase(name);
+            exec_cv.notify_all();
+        }
+    }
+    
+    void build_dependency_graph(const std::string& name, std::set<std::string>& all_targets) {
+        if (all_targets.count(name)) return;
+        if (!targets.count(name)) return;
+        
+        all_targets.insert(name);
+        
+        for (const auto& dep : targets[name].depends) {
+            build_dependency_graph(dep, all_targets);
+        }
+    }
+    
 public:
     void parse(const std::string& filename) {
         std::ifstream file(filename);
@@ -488,10 +665,36 @@ public:
                 while (std::getline(file, line)) {
                     line = trim(line);
                     if (line == "}") break;
+                    if (line.empty() || line[0] == '#') continue;
                     
                     if (line.find("depends:") == 0) {
                         std::string deps = trim(line.substr(8));
                         target.depends = split(deps, ' ');
+                    } else if (line.find("inputs:") == 0) {
+                        std::string inputs = trim(line.substr(7));
+                        std::map<std::string, Value> empty;
+                        std::string expanded_inputs = expand(inputs, empty);
+                        auto input_list = split(expanded_inputs, ' ');
+                        for (const auto& inp : input_list) {
+                            if (inp[0] == '[') {
+                                std::string var_name = inp.substr(1, inp.length() - 2);
+                                if (vars.count(var_name) && vars[var_name].type == Value::LIST) {
+                                    target.inputs.insert(target.inputs.end(), 
+                                        vars[var_name].list_val.begin(), 
+                                        vars[var_name].list_val.end());
+                                }
+                            } else {
+                                target.inputs.push_back(inp);
+                            }
+                        }
+                    } else if (line.find("outputs:") == 0) {
+                        std::string outputs = trim(line.substr(8));
+                        std::map<std::string, Value> empty;
+                        std::string expanded_outputs = expand(outputs, empty);
+                        target.outputs = split(expanded_outputs, ' ');
+                    } else if (line.find("phony:") == 0) {
+                        std::string phony_val = trim(line.substr(6));
+                        target.phony = (phony_val == "true");
                     } else if (!line.empty()) {
                         target.commands.push_back(line);
                     }
@@ -535,25 +738,101 @@ public:
         
         Target& target = targets[name];
 
-	auto start__ = std::chrono::high_resolution_clock::now(); 
-	
+        auto start__ = std::chrono::high_resolution_clock::now(); 
+        
         for (const auto& dep : target.depends) {
             execute_target(dep);
         }
 
-	auto end__ = std::chrono::high_resolution_clock::now();
-	const std::chrono::duration<double> depends_took = end__ - start__;
-	vars["DEPENDENDS_EXECUTION_TIME"] = Value(std::to_string(depends_took.count()));
+        auto end__ = std::chrono::high_resolution_clock::now();
+        const std::chrono::duration<double> depends_took = end__ - start__;
+        vars["DEPENDENDS_EXECUTION_TIME"] = Value(std::to_string(depends_took.count()));
+
 	
+        if (!needs_rebuild(target)) {
+            if (verbose) {
+                std::cout << "==> Target '" << name << "' is up to date" << std::endl;
+            }
+            executed.insert(name);
+            return;
+        }
+        
         if (verbose) std::cout << "==> Running target: " << name << std::endl;
 
-	std::map<std::string, Value> local_vars;
+        std::map<std::string, Value> local_vars;
+        local_vars["INPUTS"] = Value(target.inputs);
+        local_vars["OUTPUTS"] = Value(target.outputs);
+        
         execute_block(target.commands, local_vars);
         executed.insert(name);
     }
     
+    void execute_targets_parallel(const std::vector<std::string>& target_names) {
+        std::set<std::string> all_targets;
+        for (const auto& name : target_names) {
+            build_dependency_graph(name, all_targets);
+        }
+        
+        std::vector<std::thread> workers;
+        std::queue<std::string> ready_queue;
+        
+        for (const auto& target : all_targets) {
+            if (targets[target].depends.empty()) {
+                ready_queue.push(target);
+            }
+        }
+        
+        auto worker_func = [this, &all_targets]() {
+            while (true) {
+                std::string target_to_execute;
+                
+                {
+                    std::unique_lock<std::mutex> lock(exec_mutex);
+                    
+                    exec_cv.wait(lock, [this, &all_targets]() {
+                        if (has_error) return true;
+                        if (executed.size() == all_targets.size()) return true;
+                        
+                        for (const auto& t : all_targets) {
+                            if (!executed.count(t) && !in_progress.count(t) && can_execute(t)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+                    
+                    if (has_error || executed.size() == all_targets.size()) {
+                        return;
+                    }
+                    
+                    for (const auto& t : all_targets) {
+                        if (!executed.count(t) && !in_progress.count(t) && can_execute(t)) {
+                            target_to_execute = t;
+                            break;
+                        }
+                    }
+                }
+                
+                if (!target_to_execute.empty()) {
+                    execute_target_parallel(target_to_execute);
+                }
+            }
+        };
+        
+        for (int i = 0; i < max_jobs; i++) {
+            workers.emplace_back(worker_func);
+        }
+        
+        exec_cv.notify_all();
+        
+        for (auto& worker : workers) {
+            worker.join();
+        }
+    }
+    
     void set_dry_run(bool flag) { dry_run = flag; }
     void set_verbose(bool flag) { verbose = flag; }
+    void set_max_jobs(int jobs) { max_jobs = jobs; }
 };
 
 int main(int argc, char* argv[]) {
@@ -565,6 +844,7 @@ int main(int argc, char* argv[]) {
     Forge forge;
     bool dry_run = false;
     bool verbose = false;
+    int max_jobs = 1;
     std::vector<std::string> targets;
     
     for (int i = 1; i < argc; i++) {
@@ -573,6 +853,14 @@ int main(int argc, char* argv[]) {
             dry_run = true;
         } else if (arg == "--verbose" || arg == "-v") {
             verbose = true;
+        } else if (arg == "-j") {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                max_jobs = std::stoi(argv[++i]);
+            } else {
+                max_jobs = std::thread::hardware_concurrency();
+            }
+        } else if (arg.substr(0, 2) == "-j" && arg.length() > 2) {
+            max_jobs = std::stoi(arg.substr(2));
         } else if (arg[0] != '-') {
             targets.push_back(arg);
         }
@@ -580,6 +868,7 @@ int main(int argc, char* argv[]) {
     
     forge.set_dry_run(dry_run);
     forge.set_verbose(verbose);
+    forge.set_max_jobs(max_jobs);
     
     if (!fs::exists("Forgefile")) {
         std::cerr << "Forgefile not found" << std::endl;
@@ -588,8 +877,12 @@ int main(int argc, char* argv[]) {
     
     forge.parse("Forgefile");
     
-    for (const auto& target : targets) {
-        forge.execute_target(target);
+    if (max_jobs > 1) {
+        forge.execute_targets_parallel(targets);
+    } else {
+        for (const auto& target : targets) {
+            forge.execute_target(target);
+        }
     }
     
     return 0;
