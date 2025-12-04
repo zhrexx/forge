@@ -1,28 +1,41 @@
 BUILD_FOLDER = "build"
 
-target init {
-       mkdir {BUILD_FOLDER}
+target {
+    name = "init",
+    build = function()
+        mkdir(BUILD_FOLDER)
+    end
 }
 
-target build {
-       depends: start init link
-       println("Finished in {DEPENDENDS_EXECUTION_TIME}s")
+target {
+    name = "build",
+    depends = {"init", "link"},
+    build = function()
+        print("Building...")
+    end,
+    exec = function()
+        print("Started building...")
+    end,
+    after_exec = function()
+        print("Finished build target.")
+    end
 }
 
-target link {
-       inputs: {BUILD_FOLDER}/forge.o
-       outputs: {BUILD_FOLDER}/forge
-       depends: compile
-       g++ {BUILD_FOLDER}/forge.o -o {BUILD_FOLDER}/forge
+target {
+    name = "link",
+    inputs = {BUILD_FOLDER .. "/forge.o"},
+    outputs = {BUILD_FOLDER .. "/forge"},
+    depends = {"compile"},
+    build = function()
+        exec("g++ " .. BUILD_FOLDER .. "/forge.o -o " .. BUILD_FOLDER .. "/forge -llua")
+    end,
 }
 
-target compile {
-       inputs: forge.cpp
-       outputs: {BUILD_FOLDER}/forge.o
-       g++ -c forge.cpp -o {BUILD_FOLDER}/forge.o
-}
-
-# Executes before the other target since its first so here you can toogle things
-target start {
-       set_verbose(true)
+target {
+    name = "compile",
+    inputs = {"forge.cpp"},
+    outputs = {BUILD_FOLDER .. "/forge.o"},
+    build = function()
+        exec("g++ -c forge.cpp -o " .. BUILD_FOLDER .. "/forge.o")
+    end,
 }
